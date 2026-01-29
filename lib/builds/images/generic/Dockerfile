@@ -2,7 +2,8 @@
 # Contains rootless BuildKit + builder agent + guest-agent for debugging
 # Builds any Dockerfile provided by the user
 
-FROM moby/buildkit:rootless AS buildkit
+# Use non-rootless buildkit to avoid potential credential handling issues
+FROM moby/buildkit:latest AS buildkit
 
 # Build the builder-agent and guest-agent (multi-stage build from hypeman repo)
 FROM golang:1.25-alpine AS agent-builder
@@ -28,6 +29,13 @@ RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /guest-agent ./lib/system/guest_a
 # Final builder image - minimal alpine base
 FROM alpine:3.21
 
+# Install minimal dependencies
+RUN apk add --no-cache \
+    ca-certificates \
+    git \
+    curl \
+    fuse-overlayfs
+
 # Copy BuildKit binaries from official image
 COPY --from=buildkit /usr/bin/buildctl /usr/bin/buildctl
 COPY --from=buildkit /usr/bin/buildctl-daemonless.sh /usr/bin/buildctl-daemonless.sh
@@ -37,13 +45,6 @@ COPY --from=buildkit /usr/bin/buildkit-runc /usr/bin/runc
 # Copy builder agent and guest agent
 COPY --from=agent-builder /builder-agent /usr/bin/builder-agent
 COPY --from=agent-builder /guest-agent /usr/bin/guest-agent
-
-# Install minimal dependencies
-RUN apk add --no-cache \
-    ca-certificates \
-    git \
-    curl \
-    fuse-overlayfs
 
 # Create unprivileged user for rootless BuildKit
 RUN adduser -D -u 1000 builder && \
@@ -61,6 +62,3 @@ ENV XDG_RUNTIME_DIR=/home/builder/.local/share
 
 # Run builder agent as entrypoint
 ENTRYPOINT ["/usr/bin/builder-agent"]
-
-
-

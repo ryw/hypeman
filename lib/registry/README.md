@@ -146,13 +146,66 @@ hypeman push myimage:latest my-custom-name
 
 ## Authentication
 
-The registry endpoints use JWT bearer token authentication. The hypeman CLI reads `HYPEMAN_API_KEY` or `HYPEMAN_BEARER_TOKEN` and passes it directly as a registry token using go-containerregistry's `RegistryToken` auth.
+The registry implements [Docker Registry Token Authentication](https://distribution.github.io/distribution/spec/auth/token/):
 
-**Note:** `docker push` will not work with this registry. Docker CLI expects the v2 registry token auth flow (WWW-Authenticate challenge → token endpoint → retry with JWT), which we don't implement. Use the hypeman CLI for pushing images.
+```mermaid
+sequenceDiagram
+    participant Client as BuildKit/Docker
+    participant Registry as Hypeman Registry
+    participant Token as /v2/token
+
+    Client->>Registry: GET /v2/builds/xxx/manifests/latest
+    Registry-->>Client: 401 WWW-Authenticate: Bearer realm="/v2/token"
+    
+    Client->>Token: GET /v2/token?scope=repository:builds/xxx:push (Basic auth)
+    Token->>Token: Validate JWT, check scope
+    Token-->>Client: {"token": "bearer-token"}
+    
+    Client->>Registry: GET /v2/builds/xxx/manifests/latest (Bearer token)
+    Registry-->>Client: 200 OK
+```
+
+### Authentication Methods
+
+1. **Bearer Token**: Pass JWT directly in `Authorization: Bearer <token>` header
+2. **Basic Auth**: Pass JWT as username or password in `Authorization: Basic base64(jwt:)` or `base64(:jwt)` header (BuildKit uses identitytoken format)
+
+### Token Endpoint (`/v2/token`)
+
+The token endpoint handles the OAuth2-style token exchange:
+
+- **With credentials**: Validates the JWT and returns a bearer token if the requested scope is allowed
+- **Without credentials**: Returns 401 with `WWW-Authenticate: Basic` challenge
+
+### Registry Tokens
+
+Builder VMs receive scoped JWT tokens with:
+
+```json
+{
+  "sub": "builder-build-123",
+  "build_id": "build-123",
+  "repos": ["builds/build-123", "cache/tenant-x"],
+  "scope": "push"
+}
+```
+
+Or with per-repo permissions:
+
+```json
+{
+  "sub": "builder-build-123",
+  "build_id": "build-123",
+  "repo_access": [
+    {"repo": "builds/build-123", "scope": "push"},
+    {"repo": "cache/global/node", "scope": "pull"}
+  ]
+}
+```
 
 ## Limitations
 
-- **No docker push support**: Docker CLI requires the v2 registry token auth flow. Use `hypeman push` instead.
+- **BuildKit credential format**: BuildKit sends the `identitytoken` from `config.json` as the password in Basic auth (empty username). The token endpoint handles both formats: JWT as username (`jwt:`) and JWT as password (`:jwt`).
 
 ## Design Decisions
 
