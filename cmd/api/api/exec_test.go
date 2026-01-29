@@ -272,7 +272,6 @@ func TestExecWithDebianMinimal(t *testing.T) {
 	assert.Contains(t, stdout.String(), "Debian", "Should be running Debian")
 	assert.Contains(t, stdout.String(), "bookworm", "Should be Debian 12 (bookworm)")
 	t.Logf("OS: %s", strings.Split(stdout.String(), "\n")[0])
-
 }
 
 // collectTestLogs collects logs from an instance (non-streaming)
