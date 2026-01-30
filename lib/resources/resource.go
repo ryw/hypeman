@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/c2h5oh/datasize"
 	"github.com/kernel/hypeman/cmd/api/config"
 	"github.com/kernel/hypeman/lib/logger"
 	"github.com/kernel/hypeman/lib/paths"
@@ -20,6 +21,7 @@ const (
 	ResourceMemory  ResourceType = "memory"
 	ResourceDisk    ResourceType = "disk"
 	ResourceNetwork ResourceType = "network"
+	ResourceDiskIO  ResourceType = "disk_io"
 )
 
 // SourceType identifies how a resource capacity was determined.
@@ -62,6 +64,7 @@ type AllocationBreakdown struct {
 	DiskBytes          int64  `json:"disk_bytes"`
 	NetworkDownloadBps int64  `json:"network_download_bps"` // External→VM
 	NetworkUploadBps   int64  `json:"network_upload_bps"`   // VM→External
+	DiskIOBps          int64  `json:"disk_io_bps"`          // Disk I/O bandwidth
 }
 
 // DiskBreakdown shows disk usage by category.
@@ -78,6 +81,7 @@ type FullResourceStatus struct {
 	Memory      ResourceStatus        `json:"memory"`
 	Disk        ResourceStatus        `json:"disk"`
 	Network     ResourceStatus        `json:"network"`
+	DiskIO      ResourceStatus        `json:"disk_io"`
 	DiskDetail  *DiskBreakdown        `json:"disk_breakdown,omitempty"`
 	GPU         *GPUResourceStatus    `json:"gpu,omitempty"` // nil if no GPU available
 	Allocations []AllocationBreakdown `json:"allocations"`
@@ -99,6 +103,7 @@ type InstanceAllocation struct {
 	VolumeOverlayBytes int64  // Sum of volume overlay sizes
 	NetworkDownloadBps int64  // Download rate limit (external→VM)
 	NetworkUploadBps   int64  // Upload rate limit (VM→external)
+	DiskIOBps          int64  // Disk I/O rate limit (bytes/sec)
 	State              string // Only count running/paused/created instances
 	VolumeBytes        int64  // Sum of attached volume base sizes (for per-instance reporting)
 }
@@ -210,23 +215,36 @@ func (m *Manager) Initialize(ctx context.Context) error {
 	}
 	m.resources[ResourceNetwork] = net
 
+	// Discover disk I/O (reuses existing DiskIOCapacity method)
+	diskIO := NewDiskIOResource(m.DiskIOCapacity(), m.instanceLister)
+	m.resources[ResourceDiskIO] = diskIO
+
 	return nil
 }
 
 // GetOversubRatio returns the oversubscription ratio for a resource type.
+// Returns 1.0 (no oversubscription) if the config value is not set or <= 0.
 func (m *Manager) GetOversubRatio(rt ResourceType) float64 {
+	var ratio float64
 	switch rt {
 	case ResourceCPU:
-		return m.cfg.OversubCPU
+		ratio = m.cfg.OversubCPU
 	case ResourceMemory:
-		return m.cfg.OversubMemory
+		ratio = m.cfg.OversubMemory
 	case ResourceDisk:
-		return m.cfg.OversubDisk
+		ratio = m.cfg.OversubDisk
 	case ResourceNetwork:
-		return m.cfg.OversubNetwork
+		ratio = m.cfg.OversubNetwork
+	case ResourceDiskIO:
+		ratio = m.cfg.OversubDiskIO
 	default:
 		return 1.0
 	}
+	// Default to 1.0 (no oversubscription) if not configured
+	if ratio <= 0 {
+		return 1.0
+	}
+	return ratio
 }
 
 // GetStatus returns the current status of a specific resource type.
@@ -296,6 +314,11 @@ func (m *Manager) GetFullStatus(ctx context.Context) (*FullResourceStatus, error
 		return nil, err
 	}
 
+	diskIOStatus, err := m.GetStatus(ctx, ResourceDiskIO)
+	if err != nil {
+		return nil, err
+	}
+
 	// Get disk breakdown
 	var diskBreakdown *DiskBreakdown
 	m.mu.RLock()
@@ -331,6 +354,7 @@ func (m *Manager) GetFullStatus(ctx context.Context) (*FullResourceStatus, error
 						DiskBytes:          inst.OverlayBytes + inst.VolumeBytes,
 						NetworkDownloadBps: inst.NetworkDownloadBps,
 						NetworkUploadBps:   inst.NetworkUploadBps,
+						DiskIOBps:          inst.DiskIOBps,
 					})
 				}
 			}
@@ -345,6 +369,7 @@ func (m *Manager) GetFullStatus(ctx context.Context) (*FullResourceStatus, error
 		Memory:      *memStatus,
 		Disk:        *diskStatus,
 		Network:     *netStatus,
+		DiskIO:      *diskIOStatus,
 		DiskDetail:  diskBreakdown,
 		GPU:         gpuStatus,
 		Allocations: allocations,
@@ -358,6 +383,81 @@ func (m *Manager) CanAllocate(ctx context.Context, rt ResourceType, amount int64
 		return false, err
 	}
 	return amount <= status.Available, nil
+}
+
+// ValidateAllocation checks if the requested resources can be allocated.
+// Returns nil if allocation is allowed, or a detailed error describing
+// which resource is insufficient and the current capacity/usage.
+// Parameters match instances.AllocationRequest to implement instances.ResourceValidator.
+func (m *Manager) ValidateAllocation(ctx context.Context, vcpus int, memoryBytes int64, networkDownloadBps int64, networkUploadBps int64, diskIOBps int64, needsGPU bool) error {
+	// Check CPU
+	if vcpus > 0 {
+		status, err := m.GetStatus(ctx, ResourceCPU)
+		if err != nil {
+			return fmt.Errorf("check CPU capacity: %w", err)
+		}
+		if int64(vcpus) > status.Available {
+			return fmt.Errorf("insufficient CPU: requested %d vCPUs, but only %d available (currently allocated: %d, effective limit: %d with %.1fx oversubscription)",
+				vcpus, status.Available, status.Allocated, status.EffectiveLimit, status.OversubRatio)
+		}
+	}
+
+	// Check Memory
+	if memoryBytes > 0 {
+		status, err := m.GetStatus(ctx, ResourceMemory)
+		if err != nil {
+			return fmt.Errorf("check memory capacity: %w", err)
+		}
+		if memoryBytes > status.Available {
+			return fmt.Errorf("insufficient memory: requested %s, but only %s available (currently allocated: %s, effective limit: %s with %.1fx oversubscription)",
+				datasize.ByteSize(memoryBytes).HR(), datasize.ByteSize(status.Available).HR(), datasize.ByteSize(status.Allocated).HR(), datasize.ByteSize(status.EffectiveLimit).HR(), status.OversubRatio)
+		}
+	}
+
+	// Check Network (use max of download/upload since they share physical link)
+	netBandwidth := networkDownloadBps
+	if networkUploadBps > netBandwidth {
+		netBandwidth = networkUploadBps
+	}
+	if netBandwidth > 0 {
+		status, err := m.GetStatus(ctx, ResourceNetwork)
+		if err != nil {
+			return fmt.Errorf("check network capacity: %w", err)
+		}
+		if netBandwidth > status.Available {
+			return fmt.Errorf("insufficient network bandwidth: requested %s/s, but only %s/s available (currently allocated: %s/s, effective limit: %s/s with %.1fx oversubscription)",
+				datasize.ByteSize(netBandwidth).HR(), datasize.ByteSize(status.Available).HR(), datasize.ByteSize(status.Allocated).HR(), datasize.ByteSize(status.EffectiveLimit).HR(), status.OversubRatio)
+		}
+	}
+
+	// Check Disk I/O
+	if diskIOBps > 0 {
+		status, err := m.GetStatus(ctx, ResourceDiskIO)
+		if err != nil {
+			return fmt.Errorf("check disk I/O capacity: %w", err)
+		}
+		if diskIOBps > status.Available {
+			return fmt.Errorf("insufficient disk I/O: requested %s/s, but only %s/s available (currently allocated: %s/s, effective limit: %s/s with %.1fx oversubscription)",
+				datasize.ByteSize(diskIOBps).HR(), datasize.ByteSize(status.Available).HR(),
+				datasize.ByteSize(status.Allocated).HR(), datasize.ByteSize(status.EffectiveLimit).HR(),
+				status.OversubRatio)
+		}
+	}
+
+	// Check GPU if needed
+	if needsGPU {
+		gpuStatus := GetGPUStatus()
+		if gpuStatus == nil {
+			return fmt.Errorf("insufficient GPU: no GPU available on this host")
+		}
+		availableSlots := gpuStatus.TotalSlots - gpuStatus.UsedSlots
+		if availableSlots <= 0 {
+			return fmt.Errorf("insufficient GPU: all %d %s slots are in use",
+				gpuStatus.TotalSlots, gpuStatus.Mode)
+		}
+	}
+
+	return nil
 }
 
 // CPUCapacity returns the raw CPU capacity (number of vCPUs).

@@ -23,6 +23,7 @@ import (
 	"github.com/kernel/hypeman/lib/ingress"
 	"github.com/kernel/hypeman/lib/network"
 	"github.com/kernel/hypeman/lib/paths"
+	"github.com/kernel/hypeman/lib/resources"
 	"github.com/kernel/hypeman/lib/system"
 	"github.com/kernel/hypeman/lib/volumes"
 	"github.com/stretchr/testify/assert"
@@ -52,10 +53,17 @@ func setupTestManagerForQEMU(t *testing.T) (*manager, string) {
 		MaxOverlaySize:       100 * 1024 * 1024 * 1024, // 100GB
 		MaxVcpusPerInstance:  0,                        // unlimited
 		MaxMemoryPerInstance: 0,                        // unlimited
-		MaxTotalVcpus:        0,                        // unlimited
-		MaxTotalMemory:       0,                        // unlimited
 	}
 	mgr := NewManager(p, imageManager, systemManager, networkManager, deviceManager, volumeManager, limits, hypervisor.TypeQEMU, nil, nil).(*manager)
+
+	// Set up resource validation using the real ResourceManager
+	resourceMgr := resources.NewManager(cfg, p)
+	resourceMgr.SetInstanceLister(mgr)
+	resourceMgr.SetImageLister(imageManager)
+	resourceMgr.SetVolumeLister(volumeManager)
+	err = resourceMgr.Initialize(context.Background())
+	require.NoError(t, err)
+	mgr.SetResourceValidator(resourceMgr)
 
 	// Register cleanup to kill any orphaned QEMU processes
 	t.Cleanup(func() {
