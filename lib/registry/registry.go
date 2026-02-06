@@ -138,7 +138,16 @@ func (w *responseWrapper) WriteHeader(code int) {
 }
 
 // triggerConversion queues the image for conversion to ext4 disk format.
+// Skips BuildKit cache images (cache/*) since they're not runnable containers.
 func (r *Registry) triggerConversion(repo, reference, dockerDigest string) {
+	// Skip BuildKit cache images - they use a custom mediatype that can't be
+	// unpacked as a standard OCI image. BuildKit imports them directly from
+	// the registry without needing local conversion.
+	// Note: repo may include host prefix (e.g., "10.102.0.1:8083/cache/global/node")
+	if strings.HasPrefix(repo, "cache/") || strings.Contains(repo, "/cache/") {
+		return
+	}
+
 	imageRef := repo + ":" + reference
 	if strings.HasPrefix(reference, "sha256:") {
 		imageRef = repo + "@" + reference
