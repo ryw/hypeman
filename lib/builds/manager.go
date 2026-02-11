@@ -418,6 +418,14 @@ func (m *manager) CreateBuild(ctx context.Context, req CreateBuildRequest, sourc
 		{Repo: fmt.Sprintf("builds/%s", id), Scope: "push"},
 	}
 
+	// If the Dockerfile uses base images from the internal registry, grant pull access
+	for _, baseRepo := range extractInternalBaseImageRepos(req.Dockerfile, m.config.RegistryURL) {
+		repoAccess = append(repoAccess, RepoPermission{
+			Repo:  baseRepo,
+			Scope: "pull",
+		})
+	}
+
 	if req.IsAdminBuild {
 		// Admin build: push access to global cache
 		if req.GlobalCacheKey != "" {
@@ -1264,6 +1272,14 @@ func (m *manager) refreshBuildToken(buildID string, req *CreateBuildRequest) err
 		{Repo: fmt.Sprintf("builds/%s", buildID), Scope: "push"},
 	}
 
+	// If the Dockerfile uses base images from the internal registry, grant pull access
+	for _, baseRepo := range extractInternalBaseImageRepos(req.Dockerfile, m.config.RegistryURL) {
+		repoAccess = append(repoAccess, RepoPermission{
+			Repo:  baseRepo,
+			Scope: "pull",
+		})
+	}
+
 	if req.IsAdminBuild {
 		// Admin build: push access to global cache
 		if req.GlobalCacheKey != "" {
@@ -1360,6 +1376,65 @@ func (m *manager) createBuildConfigVolume(buildID, volID string) (string, error)
 	}
 
 	return diskPath, nil
+}
+
+// extractInternalBaseImageRepos parses the Dockerfile's FROM lines and returns
+// all repository paths that reference the internal registry. Returns nil
+// if no base images reference the internal registry.
+func extractInternalBaseImageRepos(dockerfile, registryURL string) []string {
+	if dockerfile == "" {
+		return nil
+	}
+
+	registryHost := stripRegistryScheme(registryURL)
+	seen := make(map[string]bool)
+	var repos []string
+
+	scanner := bufio.NewScanner(strings.NewReader(dockerfile))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		upper := strings.ToUpper(line)
+		if !strings.HasPrefix(upper, "FROM ") {
+			continue
+		}
+
+		// Parse: FROM [--platform=...] image[:tag|@digest] [AS name]
+		parts := strings.Fields(line)
+		imageIdx := 1
+		for imageIdx < len(parts) && strings.HasPrefix(parts[imageIdx], "--") {
+			imageIdx++
+		}
+		if imageIdx >= len(parts) {
+			continue
+		}
+
+		imageRef := parts[imageIdx]
+		if strings.ToLower(imageRef) == "scratch" {
+			continue
+		}
+
+		// Check if the image references the internal registry
+		if !strings.HasPrefix(imageRef, registryHost+"/") {
+			continue
+		}
+
+		// Strip the registry host to get the repo path, then strip digest and tag.
+		// An image ref can have both: registry/org/img:v1@sha256:abc123
+		repo := strings.TrimPrefix(imageRef, registryHost+"/")
+		if idx := strings.LastIndex(repo, "@"); idx != -1 {
+			repo = repo[:idx]
+		}
+		if idx := strings.LastIndex(repo, ":"); idx != -1 {
+			repo = repo[:idx]
+		}
+
+		if !seen[repo] {
+			seen[repo] = true
+			repos = append(repos, repo)
+		}
+	}
+
+	return repos
 }
 
 // copyFile copies a file from src to dst
