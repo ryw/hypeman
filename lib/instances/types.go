@@ -82,9 +82,20 @@ type StoredMetadata struct {
 	GPUProfile  string // vGPU profile name (e.g., "L40S-1Q")
 	GPUMdevUUID string // mdev device UUID
 
+	// Command overrides (like docker run <image> <command>)
+	Entrypoint []string // Override image entrypoint (nil = use image default)
+	Cmd        []string // Override image cmd (nil = use image default)
+
 	// Boot optimizations
 	SkipKernelHeaders bool // Skip kernel headers installation (disables DKMS)
 	SkipGuestAgent    bool // Skip guest-agent installation (disables exec/stat API)
+
+	// Shutdown configuration
+	StopTimeout int // Grace period in seconds for graceful stop (0 = use default 10s)
+
+	// Exit information (populated from serial console sentinel when VM stops)
+	ExitCode    *int   // App exit code, nil if VM hasn't exited
+	ExitMessage string // Human-readable description of exit (e.g., "command not found", "killed by signal 9 (SIGKILL) - OOM")
 }
 
 // Instance represents a virtual machine instance with derived runtime state
@@ -126,8 +137,16 @@ type CreateInstanceRequest struct {
 	Volumes                  []VolumeAttachment // Volumes to attach at creation time
 	Hypervisor               hypervisor.Type    // Optional: hypervisor type (defaults to config)
 	GPU                      *GPUConfig         // Optional: vGPU configuration
+	Entrypoint               []string           // Override image entrypoint (nil = use image default)
+	Cmd                      []string           // Override image cmd (nil = use image default)
 	SkipKernelHeaders        bool               // Skip kernel headers installation (disables DKMS)
 	SkipGuestAgent           bool               // Skip guest-agent installation (disables exec/stat API)
+}
+
+// StartInstanceRequest is the domain request for starting a stopped instance
+type StartInstanceRequest struct {
+	Entrypoint []string // Override entrypoint (nil = keep previous/image default)
+	Cmd        []string // Override cmd (nil = keep previous/image default)
 }
 
 // AttachVolumeRequest is the domain request for attaching a volume (used for API compatibility)

@@ -3,12 +3,18 @@ package instances
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/kernel/hypeman/lib/hypervisor"
 	"github.com/kernel/hypeman/lib/logger"
 )
+
+// exitSentinelPrefix is the machine-parseable prefix written by init to serial console.
+const exitSentinelPrefix = "HYPEMAN-EXIT "
 
 // stateResult holds the result of state derivation
 type stateResult struct {
@@ -104,7 +110,155 @@ func (m *manager) toInstance(ctx context.Context, meta *metadata) Instance {
 		StateError:     result.Error,
 		HasSnapshot:    m.hasSnapshot(meta.StoredMetadata.DataDir),
 	}
+
+	// If VM is stopped and exit info isn't persisted yet, populate in-memory
+	// from the serial console log. This is read-only -- no metadata writes.
+	// Persistence happens under lock in stopInstance or persistExitInfo.
+	if inst.State == StateStopped && inst.ExitCode == nil {
+		if code, msg, ok := m.parseExitSentinel(inst.Id); ok {
+			inst.ExitCode = &code
+			inst.ExitMessage = msg
+		}
+	}
+
 	return inst
+}
+
+// parseExitSentinel reads the last lines of the serial console log to find the
+// HYPEMAN-EXIT sentinel written by init before shutdown.
+// Returns the exit code, message, and whether a sentinel was found.
+// This is a pure reader with no side effects.
+func (m *manager) parseExitSentinel(id string) (int, string, bool) {
+	logPath := m.paths.InstanceAppLog(id)
+
+	// Read the tail of the log file. The sentinel is written near the end
+	// (just before reboot), so we only need the last few KB even if the
+	// serial console log is large from a chatty app.
+	const tailSize = 8192
+	data, err := readTail(logPath, tailSize)
+	if err != nil {
+		return 0, "", false
+	}
+
+	// Scan lines from the tail looking for the sentinel
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		code, msg, ok := parseExitSentinelLine(line)
+		if ok {
+			return code, msg, true
+		}
+	}
+	return 0, "", false
+}
+
+// persistExitInfo parses exit info from the serial console and persists it to
+// metadata. Must be called under the instance lock.
+func (m *manager) persistExitInfo(ctx context.Context, id string) {
+	log := logger.FromContext(ctx)
+
+	meta, err := m.loadMetadata(id)
+	if err != nil {
+		return
+	}
+
+	// Already persisted
+	if meta.ExitCode != nil {
+		return
+	}
+
+	code, msg, ok := m.parseExitSentinel(id)
+	if !ok {
+		return
+	}
+
+	meta.ExitCode = &code
+	meta.ExitMessage = msg
+	if err := m.saveMetadata(meta); err != nil {
+		log.WarnContext(ctx, "failed to persist exit info", "instance_id", id, "error", err)
+	} else {
+		log.DebugContext(ctx, "parsed exit info from serial log", "instance_id", id, "exit_code", code, "exit_message", msg)
+	}
+}
+
+// readTail reads the last n bytes of a file. If the file is smaller than n,
+// the entire file is returned.
+func readTail(path string, n int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	offset := info.Size() - n
+	if offset < 0 {
+		offset = 0
+	}
+
+	if offset > 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return nil, err
+		}
+	}
+
+	return io.ReadAll(f)
+}
+
+// parseExitSentinelLine parses a single log line looking for the HYPEMAN-EXIT sentinel.
+// The sentinel format is embedded in a log line like:
+// 2026-02-13T15:26:27Z [INFO] [hypeman-init:entrypoint] HYPEMAN-EXIT code=127 message="command not found"
+// Returns the exit code, message, and whether parsing was successful.
+func parseExitSentinelLine(line string) (int, string, bool) {
+	// Strip whitespace -- serial console (TTY) adds \r to line endings
+	line = strings.TrimSpace(line)
+
+	idx := strings.Index(line, exitSentinelPrefix)
+	if idx < 0 {
+		return 0, "", false
+	}
+
+	// Extract the part after "HYPEMAN-EXIT "
+	sentinel := line[idx+len(exitSentinelPrefix):]
+
+	// Parse code=N
+	if !strings.HasPrefix(sentinel, "code=") {
+		return 0, "", false
+	}
+	sentinel = sentinel[5:] // skip "code="
+
+	// Find the end of the code number
+	spaceIdx := strings.Index(sentinel, " ")
+	if spaceIdx < 0 {
+		// Just a code, no message
+		code, err := strconv.Atoi(sentinel)
+		if err != nil {
+			return 0, "", false
+		}
+		return code, "", true
+	}
+
+	code, err := strconv.Atoi(sentinel[:spaceIdx])
+	if err != nil {
+		return 0, "", false
+	}
+
+	// Parse message="..."
+	rest := sentinel[spaceIdx+1:]
+	if strings.HasPrefix(rest, "message=") {
+		msgStr := rest[8:] // skip "message="
+		// Unquote the message (it's Go-quoted via %q)
+		if unquoted, err := strconv.Unquote(msgStr); err == nil {
+			return code, unquoted, true
+		}
+		// If unquoting fails, use raw value (strip quotes if present)
+		return code, strings.Trim(msgStr, "\""), true
+	}
+
+	return code, "", true
 }
 
 // listInstances returns all instances

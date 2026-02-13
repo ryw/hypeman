@@ -28,7 +28,7 @@ type Manager interface {
 	StandbyInstance(ctx context.Context, id string) (*Instance, error)
 	RestoreInstance(ctx context.Context, id string) (*Instance, error)
 	StopInstance(ctx context.Context, id string) (*Instance, error)
-	StartInstance(ctx context.Context, id string) (*Instance, error)
+	StartInstance(ctx context.Context, id string, req StartInstanceRequest) (*Instance, error)
 	StreamInstanceLogs(ctx context.Context, id string, tail int, follow bool, source LogSource) (<-chan string, error)
 	RotateLogs(ctx context.Context, maxBytes int64, maxFiles int) error
 	AttachVolume(ctx context.Context, id string, volumeId string, req AttachVolumeRequest) (*Instance, error)
@@ -149,6 +149,15 @@ func (m *manager) getInstanceLock(id string) *sync.RWMutex {
 	return lock.(*sync.RWMutex)
 }
 
+// maybePersistExitInfo persists exit info to metadata under the instance write lock.
+// Called from read paths when in-memory exit info was parsed but not yet persisted.
+func (m *manager) maybePersistExitInfo(ctx context.Context, id string) {
+	lock := m.getInstanceLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	m.persistExitInfo(ctx, id)
+}
+
 // CreateInstance creates and starts a new instance
 func (m *manager) CreateInstance(ctx context.Context, req CreateInstanceRequest) (*Instance, error) {
 	// Note: ID is generated inside createInstance, so we can't lock before calling it.
@@ -197,12 +206,12 @@ func (m *manager) StopInstance(ctx context.Context, id string) (*Instance, error
 	return m.stopInstance(ctx, id)
 }
 
-// StartInstance starts a stopped instance
-func (m *manager) StartInstance(ctx context.Context, id string) (*Instance, error) {
+// StartInstance starts a stopped instance with optional command overrides
+func (m *manager) StartInstance(ctx context.Context, id string, req StartInstanceRequest) (*Instance, error) {
 	lock := m.getInstanceLock(id)
 	lock.Lock()
 	defer lock.Unlock()
-	return m.startInstance(ctx, id)
+	return m.startInstance(ctx, id, req)
 }
 
 // ListInstances returns all instances
@@ -222,6 +231,11 @@ func (m *manager) GetInstance(ctx context.Context, idOrName string) (*Instance, 
 	inst, err := m.getInstance(ctx, idOrName)
 	lock.RUnlock()
 	if err == nil {
+		// If VM is stopped with unpersisted exit info, persist under write lock.
+		// This handles the "app exited on its own" case where stopInstance wasn't called.
+		if inst.State == StateStopped && inst.ExitCode != nil {
+			m.maybePersistExitInfo(ctx, inst.Id)
+		}
 		return inst, nil
 	}
 
@@ -239,7 +253,11 @@ func (m *manager) GetInstance(ctx context.Context, idOrName string) (*Instance, 
 		}
 	}
 	if len(nameMatches) == 1 {
-		return &nameMatches[0], nil
+		inst := &nameMatches[0]
+		if inst.State == StateStopped && inst.ExitCode != nil {
+			m.maybePersistExitInfo(ctx, inst.Id)
+		}
+		return inst, nil
 	}
 	if len(nameMatches) > 1 {
 		return nil, ErrAmbiguousName
@@ -253,7 +271,11 @@ func (m *manager) GetInstance(ctx context.Context, idOrName string) (*Instance, 
 		}
 	}
 	if len(prefixMatches) == 1 {
-		return &prefixMatches[0], nil
+		inst := &prefixMatches[0]
+		if inst.State == StateStopped && inst.ExitCode != nil {
+			m.maybePersistExitInfo(ctx, inst.Id)
+		}
+		return inst, nil
 	}
 	if len(prefixMatches) > 1 {
 		return nil, ErrAmbiguousName

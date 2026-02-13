@@ -308,6 +308,8 @@ func (m *manager) createInstance(
 		Devices:                  resolvedDeviceIDs,
 		GPUProfile:               gpuProfile,
 		GPUMdevUUID:              gpuMdevUUID,
+		Entrypoint:               req.Entrypoint,
+		Cmd:                      req.Cmd,
 		SkipKernelHeaders:        req.SkipKernelHeaders,
 		SkipGuestAgent:           req.SkipGuestAgent,
 	}

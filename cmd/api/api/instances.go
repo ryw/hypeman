@@ -219,6 +219,16 @@ func (s *ApiService) CreateInstance(ctx context.Context, request oapi.CreateInst
 		}
 	}
 
+	// Parse command overrides (like docker run --entrypoint / docker run <image> <command>)
+	var entrypoint []string
+	if request.Body.Entrypoint != nil {
+		entrypoint = *request.Body.Entrypoint
+	}
+	var cmd []string
+	if request.Body.Cmd != nil {
+		cmd = *request.Body.Cmd
+	}
+
 	domainReq := instances.CreateInstanceRequest{
 		Name:                     request.Body.Name,
 		Image:                    request.Body.Image,
@@ -236,6 +246,8 @@ func (s *ApiService) CreateInstance(ctx context.Context, request oapi.CreateInst
 		Volumes:                  volumes,
 		Hypervisor:               hvType,
 		GPU:                      gpuConfig,
+		Entrypoint:               entrypoint,
+		Cmd:                      cmd,
 		SkipKernelHeaders:        request.Body.SkipKernelHeaders != nil && *request.Body.SkipKernelHeaders,
 		SkipGuestAgent:           request.Body.SkipGuestAgent != nil && *request.Body.SkipGuestAgent,
 	}
@@ -467,7 +479,18 @@ func (s *ApiService) StartInstance(ctx context.Context, request oapi.StartInstan
 	}
 	log := logger.FromContext(ctx)
 
-	result, err := s.InstanceManager.StartInstance(ctx, inst.Id)
+	// Parse optional command overrides from request body
+	var startReq instances.StartInstanceRequest
+	if request.Body != nil {
+		if request.Body.Entrypoint != nil {
+			startReq.Entrypoint = *request.Body.Entrypoint
+		}
+		if request.Body.Cmd != nil {
+			startReq.Cmd = *request.Body.Cmd
+		}
+	}
+
+	result, err := s.InstanceManager.StartInstance(ctx, inst.Id, startReq)
 	if err != nil {
 		switch {
 		case errors.Is(err, instances.ErrInvalidState):
@@ -732,8 +755,13 @@ func instanceToOAPI(inst instances.Instance) oapi.Instance {
 		CreatedAt:   inst.CreatedAt,
 		StartedAt:   inst.StartedAt,
 		StoppedAt:   inst.StoppedAt,
+		ExitCode:    inst.ExitCode,
 		HasSnapshot: lo.ToPtr(inst.HasSnapshot),
 		Hypervisor:  &hvType,
+	}
+
+	if inst.ExitMessage != "" {
+		oapiInst.ExitMessage = lo.ToPtr(inst.ExitMessage)
 	}
 
 	if len(inst.Env) > 0 {
