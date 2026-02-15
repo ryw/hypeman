@@ -21,21 +21,25 @@
 
 ## Requirements
 
-Hypeman server runs on **Linux** with **KVM** virtualization support. The CLI can run locally on the server or connect remotely from any machine.
+### Linux
+**KVM** virtualization support required. Supports Cloud Hypervisor and QEMU as hypervisors.
+
+### macOS
+**macOS 11.0+** on Apple Silicon. Uses Apple's Virtualization.framework via the `vz` hypervisor.
 
 ## Quick Start
 
-Install Hypeman on your Linux server:
+Install Hypeman (Linux and macOS supported):
 
 ```bash
 curl -fsSL https://get.hypeman.sh | bash
 ```
 
-This installs both the Hypeman server and CLI. The installer handles all dependencies, KVM access, and network configuration automatically.
+This installs both the Hypeman server and CLI. The installer handles all dependencies and configuration automatically.
 
-## CLI Installation (Remote Access)
+## CLI Installation
 
-To connect to a Hypeman server from another machine, install just the CLI:
+To use Hypeman via the CLI on a separate machine:
 
 **Homebrew:**
 ```bash
@@ -47,17 +51,11 @@ brew install kernel/tap/hypeman
 go install 'github.com/kernel/hypeman-cli/cmd/hypeman@latest'
 ```
 
-**Configure remote access:**
+**Configure CLI access:**
 
-1. On the server, generate an API token:
 ```bash
-hypeman-token
-```
-
-2. On your local machine, set the environment variables:
-```bash
-export HYPEMAN_API_KEY="<token-from-server>"
-export HYPEMAN_BASE_URL="http://<server-ip>:8080"
+export HYPEMAN_API_KEY="<token>"
+export HYPEMAN_BASE_URL="http://<host>:8080"
 ```
 
 ## Usage
