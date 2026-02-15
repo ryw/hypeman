@@ -201,6 +201,11 @@ build-linux: ensure-ch-binaries ensure-caddy-binaries build-embedded | $(BIN_DIR
 # Build all binaries
 build-all: build
 
+# Run without live reload (build once and run)
+run: build
+	sudo setcap cap_net_admin,cap_net_bind_service=+eip $(BIN_DIR)/hypeman
+	$(BIN_DIR)/hypeman
+
 # Run in development mode with hot reload
 # On macOS, redirects to dev-darwin which uses vz instead of cloud-hypervisor
 dev:

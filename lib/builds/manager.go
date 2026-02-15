@@ -19,11 +19,11 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/layout"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
-	"github.com/nrednav/cuid2"
 	"github.com/kernel/hypeman/lib/images"
 	"github.com/kernel/hypeman/lib/instances"
 	"github.com/kernel/hypeman/lib/paths"
 	"github.com/kernel/hypeman/lib/volumes"
+	"github.com/nrednav/cuid2"
 	"go.opentelemetry.io/otel/metric"
 )
 
@@ -195,7 +195,7 @@ func (m *manager) Start(ctx context.Context) error {
 func (m *manager) ensureBuilderImage(ctx context.Context) {
 	defer m.builderReady.Store(true)
 
-	if m.config.BuilderImage != "" {
+	if m.config.BuilderImage != "" && m.config.BuilderImage != "none" {
 		// Explicit builder image configured - check if already available
 		if _, err := m.imageManager.GetImage(ctx, m.config.BuilderImage); err == nil {
 			m.logger.Info("builder image already available", "image", m.config.BuilderImage)
@@ -296,8 +296,8 @@ func (m *manager) buildBuilderFromDockerfile(ctx context.Context) (string, error
 	if err != nil {
 		return "", fmt.Errorf("get image digest: %w", err)
 	}
-	digest := digestHash.String()   // "sha256:abc123..."
-	digestHex := digestHash.Hex      // "abc123..."
+	digest := digestHash.String() // "sha256:abc123..."
+	digestHex := digestHash.Hex   // "abc123..."
 
 	// Write directly to the shared OCI layout cache.
 	// This is the same cache used by the image manager's OCI client, so when
@@ -409,13 +409,17 @@ func (m *manager) CreateBuild(ctx context.Context, req CreateBuildRequest, sourc
 	// Token grants per-repo access based on build type:
 	// - Regular builds: push to builds/{id}, push to cache/{tenant}, pull from cache/global/{runtime}
 	// - Admin builds: push to builds/{id}, push to cache/global/{runtime}
+	// - When ImageName is set, the server re-tags the image after the build completes
 	tokenTTL := time.Duration(policy.TimeoutSeconds) * time.Second
 	if tokenTTL < 30*time.Minute {
 		tokenTTL = 30 * time.Minute // Minimum 30 minutes
 	}
 
+	// The builder always pushes to builds/{id}. When image_name is set, the
+	// server re-tags the image after the push completes.
+	buildRepo := fmt.Sprintf("builds/%s", id)
 	repoAccess := []RepoPermission{
-		{Repo: fmt.Sprintf("builds/%s", id), Scope: "push"},
+		{Repo: buildRepo, Scope: "push"},
 	}
 
 	// If the Dockerfile uses base images from the internal registry, grant pull access
@@ -499,6 +503,7 @@ func (m *manager) CreateBuild(ctx context.Context, req CreateBuildRequest, sourc
 		NetworkMode:      policy.NetworkMode,
 		IsAdminBuild:     req.IsAdminBuild,
 		GlobalCacheKey:   req.GlobalCacheKey,
+		ImageName:        req.ImageName,
 	}
 	if err := writeBuildConfig(m.paths, id, buildConfig); err != nil {
 		deleteBuild(m.paths, id)
@@ -585,14 +590,13 @@ func (m *manager) runBuild(ctx context.Context, id string, req CreateBuildReques
 	}
 
 	m.logger.Info("build succeeded", "id", id, "digest", result.ImageDigest, "duration", duration)
-	registryHost := stripRegistryScheme(m.config.RegistryURL)
-	imageRef := fmt.Sprintf("%s/builds/%s", registryHost, id)
 
-	// Wait for image to be ready before reporting build as complete.
+	// Wait for build image to be ready before reporting build as complete.
+	// The builder always pushes to builds/{id}, so that's what we wait for.
 	// This fixes the race condition (KERNEL-863) where build reports "ready"
 	// but image conversion hasn't finished yet.
-	// Use buildCtx to respect the build timeout during image wait.
-	if err := m.waitForImageReady(buildCtx, id); err != nil {
+	buildRepo := fmt.Sprintf("builds/%s", id)
+	if err := m.waitForImageReady(buildCtx, buildRepo); err != nil {
 		// Recalculate duration to include image wait time
 		duration = time.Since(start)
 		durationMS = duration.Milliseconds()
@@ -603,6 +607,34 @@ func (m *manager) runBuild(ctx context.Context, id string, req CreateBuildReques
 			m.metrics.RecordBuild(buildCtx, "failed", duration)
 		}
 		return
+	}
+
+	// If image_name is set, re-tag the image so it's accessible by that name.
+	// The builder pushed to builds/{id} but the user wants it as image_name.
+	imageRef := buildRepo
+	if req.ImageName != "" {
+		ref, err := images.ParseNormalizedRef(req.ImageName)
+		if err != nil {
+			m.logger.Warn("failed to parse image_name", "build_id", id, "image_name", req.ImageName, "error", err)
+		} else {
+			repo := ref.Repository()
+			tag := ref.Tag()
+			if tag == "" {
+				tag = "latest"
+			}
+			taggedRef := repo + ":" + tag
+			if _, err := m.imageManager.ImportLocalImage(buildCtx, repo, tag, result.ImageDigest); err != nil {
+				m.logger.Warn("failed to re-tag image", "build_id", id, "image_name", req.ImageName, "error", err)
+				// imageRef stays as buildRepo — the image is still accessible via builds/{id}
+			} else {
+				m.logger.Info("re-tagged build image", "build_id", id, "from", buildRepo, "to", taggedRef)
+				imageRef = req.ImageName // Only set custom name after successful re-tag
+				// Wait for the re-tagged image to be ready (use full tagged ref)
+				if err := m.waitForImageReady(buildCtx, taggedRef); err != nil {
+					m.logger.Warn("re-tagged image conversion timed out", "build_id", id, "image_name", req.ImageName, "error", err)
+				}
+			}
+		}
 	}
 
 	// Recalculate duration to include image wait time for accurate reporting
@@ -917,17 +949,16 @@ func (m *manager) updateBuildComplete(id string, status string, digest *string, 
 }
 
 // waitForImageReady polls the image manager until the build's image is ready.
+// imageRef should be the short repo name (e.g., "builds/abc123" or "myapp")
+// matching what triggerConversion stores in the image manager.
 // This ensures that when a build reports "ready", the image is actually usable
 // for instance creation (fixes KERNEL-863 race condition).
-func (m *manager) waitForImageReady(ctx context.Context, id string) error {
-	registryHost := stripRegistryScheme(m.config.RegistryURL)
-	imageRef := fmt.Sprintf("%s/builds/%s", registryHost, id)
-
+func (m *manager) waitForImageReady(ctx context.Context, imageRef string) error {
 	// Poll for up to 60 seconds (image conversion is typically fast)
 	const maxAttempts = 120
 	const pollInterval = 500 * time.Millisecond
 
-	m.logger.Debug("waiting for image to be ready", "id", id, "image_ref", imageRef)
+	m.logger.Debug("waiting for image to be ready", "image_ref", imageRef)
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		select {
@@ -940,7 +971,7 @@ func (m *manager) waitForImageReady(ctx context.Context, id string) error {
 		if err == nil {
 			switch img.Status {
 			case images.StatusReady:
-				m.logger.Debug("image is ready", "id", id, "image_ref", imageRef, "attempts", attempt+1)
+				m.logger.Debug("image is ready", "image_ref", imageRef, "attempts", attempt+1)
 				return nil
 			case images.StatusFailed:
 				return fmt.Errorf("image conversion failed")
@@ -1299,8 +1330,9 @@ func (m *manager) refreshBuildToken(buildID string, req *CreateBuildRequest) err
 	}
 
 	// Generate per-repo access list (same logic as CreateBuild)
+	buildRepo := fmt.Sprintf("builds/%s", buildID)
 	repoAccess := []RepoPermission{
-		{Repo: fmt.Sprintf("builds/%s", buildID), Scope: "push"},
+		{Repo: buildRepo, Scope: "push"},
 	}
 
 	// If the Dockerfile uses base images from the internal registry, grant pull access

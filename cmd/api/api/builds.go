@@ -10,6 +10,7 @@ import (
 	"strconv"
 
 	"github.com/kernel/hypeman/lib/builds"
+	"github.com/kernel/hypeman/lib/images"
 	"github.com/kernel/hypeman/lib/logger"
 	"github.com/kernel/hypeman/lib/oapi"
 )
@@ -41,7 +42,7 @@ func (s *ApiService) CreateBuild(ctx context.Context, request oapi.CreateBuildRe
 
 	// Parse multipart form fields
 	var sourceData []byte
-	var baseImageDigest, cacheScope, dockerfile, globalCacheKey string
+	var baseImageDigest, cacheScope, dockerfile, globalCacheKey, imageName string
 	var timeoutSeconds int
 	var isAdminBuild bool
 	var secrets []builds.SecretRef
@@ -137,6 +138,15 @@ func (s *ApiService) CreateBuild(ctx context.Context, request oapi.CreateBuildRe
 				}, nil
 			}
 			globalCacheKey = string(data)
+		case "image_name":
+			data, err := io.ReadAll(part)
+			if err != nil {
+				return oapi.CreateBuild400JSONResponse{
+					Code:    "invalid_request",
+					Message: "failed to read image_name field",
+				}, nil
+			}
+			imageName = string(data)
 		}
 		part.Close()
 	}
@@ -148,17 +158,29 @@ func (s *ApiService) CreateBuild(ctx context.Context, request oapi.CreateBuildRe
 		}, nil
 	}
 
+	// Validate image_name early so the user gets a fast 400 instead of
+	// a successful build that silently falls back to builds/{id}.
+	if imageName != "" {
+		if _, err := images.ParseNormalizedRef(imageName); err != nil {
+			return oapi.CreateBuild400JSONResponse{
+				Code:    "invalid_request",
+				Message: fmt.Sprintf("invalid image_name: %v", err),
+			}, nil
+		}
+	}
+
 	// Note: Dockerfile validation happens in the builder agent.
 	// It will check if Dockerfile is in the source tarball or provided via dockerfile parameter.
 
 	// Build domain request
 	domainReq := builds.CreateBuildRequest{
-		BaseImageDigest:    baseImageDigest,
-		CacheScope:         cacheScope,
-		Dockerfile:         dockerfile,
-		Secrets:            secrets,
-		IsAdminBuild:       isAdminBuild,
-		GlobalCacheKey: globalCacheKey,
+		BaseImageDigest: baseImageDigest,
+		CacheScope:      cacheScope,
+		Dockerfile:      dockerfile,
+		Secrets:         secrets,
+		IsAdminBuild:    isAdminBuild,
+		GlobalCacheKey:  globalCacheKey,
+		ImageName:       imageName,
 	}
 
 	// Apply timeout if provided
