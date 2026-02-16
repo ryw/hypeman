@@ -89,45 +89,46 @@ root  hard  nofile  65536
 
 ## Configuration
 
-### Environment variables
+Hypeman reads configuration from a YAML config file. See `config.example.yaml` (Linux) and `config.example.darwin.yaml` (macOS) for all available settings with comments.
 
-Hypeman can be configured using the following environment variables:
+The config file is searched in these locations (first match wins):
+- Path specified by `CONFIG_PATH` environment variable
+- `/etc/hypeman/config.yaml` (Linux)
+- `~/.config/hypeman/config.yaml` (all platforms)
 
-| Variable                   | Description                                                                                  | Default            |
-| -------------------------- | -------------------------------------------------------------------------------------------- | ------------------ |
-| `PORT`                     | HTTP server port                                                                             | `8080`             |
-| `DATA_DIR`                 | Directory for storing VM images, volumes, and other data                                     | `/var/lib/hypeman` |
-| `BRIDGE_NAME`              | Name of the network bridge for VM networking                                                 | `vmbr0`            |
-| `SUBNET_CIDR`              | CIDR notation for the VM network subnet (gateway derived automatically)                      | `10.100.0.0/16`    |
-| `UPLINK_INTERFACE`         | Host network interface to use for VM internet access                                         | _(auto-detect)_    |
-| `JWT_SECRET`               | Secret key for JWT authentication (required for production)                                  | _(empty)_          |
-| `DNS_SERVER`               | DNS server IP address for VMs                                                                | `1.1.1.1`          |
-| `MAX_CONCURRENT_BUILDS`    | Maximum number of concurrent image builds                                                    | `1`                |
-| `MAX_OVERLAY_SIZE`         | Maximum size for overlay filesystem                                                          | `100GB`            |
-| `ENV`                      | Deployment environment (filters telemetry, e.g. your name for dev)                           | `unset`            |
-| `OTEL_ENABLED`             | Enable OpenTelemetry traces/metrics                                                          | `false`            |
-| `OTEL_ENDPOINT`            | OTLP gRPC endpoint                                                                           | `127.0.0.1:4317`   |
-| `OTEL_SERVICE_INSTANCE_ID` | Instance ID for telemetry (differentiates multiple servers)                                  | hostname           |
-| `LOG_LEVEL`                | Default log level (debug, info, warn, error)                                                 | `info`             |
-| `LOG_LEVEL_<SUBSYSTEM>`    | Per-subsystem log level (API, IMAGES, INSTANCES, NETWORK, VOLUMES, VMM, SYSTEM, EXEC, CADDY) | inherits default   |
-| `CADDY_LISTEN_ADDRESS`     | Address for Caddy ingress listeners                                                          | `0.0.0.0`          |
-| `CADDY_ADMIN_ADDRESS`      | Address for Caddy admin API                                                                  | `127.0.0.1`        |
-| `CADDY_ADMIN_PORT`         | Port for Caddy admin API                                                                     | `2019`             |
-| `CADDY_STOP_ON_SHUTDOWN`   | Stop Caddy when hypeman shuts down (set to `true` for dev)                                   | `false`            |
-| `ACME_EMAIL`               | Email for ACME certificate registration (required for TLS ingresses)                         | _(empty)_          |
-| `ACME_DNS_PROVIDER`        | DNS provider for ACME challenges: `cloudflare`                                               | _(empty)_          |
-| `ACME_CA`                  | ACME CA URL (empty = Let's Encrypt production)                                               | _(empty)_          |
-| `TLS_ALLOWED_DOMAINS`      | Comma-separated allowed domains for TLS (e.g., `*.example.com,api.other.com`)                | _(empty)_          |
-| `DNS_PROPAGATION_TIMEOUT`  | Max time to wait for DNS propagation (e.g., `2m`)                                            | _(empty)_          |
-| `DNS_RESOLVERS`            | Comma-separated DNS resolvers for propagation checking                                       | _(empty)_          |
-| `CLOUDFLARE_API_TOKEN`     | Cloudflare API token (when using `cloudflare` provider)                                      | _(empty)_          |
-| `DOCKER_SOCKET`            | Path to Docker socket (for builder image builds)                                             | `/var/run/docker.sock` |
+Common settings:
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `port` | HTTP server port | `8080` |
+| `data_dir` | Data directory for VM images, volumes, etc. | `/var/lib/hypeman` |
+| `jwt_secret` | Secret key for JWT authentication (required) | _(empty)_ |
+| `env` | Deployment environment (filters telemetry) | `unset` |
+| `network.bridge_name` | Network bridge for VM networking | `vmbr0` |
+| `network.subnet_cidr` | CIDR for the VM network subnet | `10.100.0.0/16` |
+| `network.uplink_interface` | Host interface for VM internet access | _(auto-detect)_ |
+| `network.dns_server` | DNS server for VMs | `1.1.1.1` |
+| `caddy.listen_address` | Address for Caddy ingress listeners | `0.0.0.0` |
+| `caddy.admin_address` | Address for Caddy admin API | `127.0.0.1` |
+| `caddy.admin_port` | Port for Caddy admin API | `2019` |
+| `caddy.stop_on_shutdown` | Stop Caddy when hypeman shuts down | `false` |
+| `logging.level` | Log level (debug, info, warn, error) | `info` |
+| `otel.enabled` | Enable OpenTelemetry traces/metrics | `false` |
+| `otel.endpoint` | OTLP gRPC endpoint | `127.0.0.1:4317` |
+| `limits.max_concurrent_builds` | Max concurrent image builds | `1` |
+| `limits.max_overlay_size` | Max overlay filesystem size | `100GB` |
+| `acme.email` | Email for ACME certificate registration | _(empty)_ |
+| `acme.dns_provider` | DNS provider for ACME challenges | _(empty)_ |
+| `acme.cloudflare_api_token` | Cloudflare API token | _(empty)_ |
+| `build.docker_socket` | Path to Docker socket | `/var/run/docker.sock` |
+
+Environment variables can also override any config key using `__` as the nesting separator (e.g. `CADDY__LISTEN_ADDRESS` overrides `caddy.listen_address`).
 
 **Important: Subnet Configuration**
 
 The default subnet `10.100.0.0/16` is chosen to avoid common conflicts. Hypeman will detect conflicts with existing routes on startup and fail with guidance.
 
-If you need a different subnet, set `SUBNET_CIDR` in your environment. The gateway is automatically derived as the first IP in the subnet (e.g., `10.100.0.0/16` → `10.100.0.1`).
+If you need a different subnet, set `network.subnet_cidr` in your config file. The gateway is automatically derived as the first IP in the subnet (e.g., `10.100.0.0/16` → `10.100.0.1`).
 
 **Alternative subnets if needed:**
 
@@ -136,14 +137,15 @@ If you need a different subnet, set `SUBNET_CIDR` in your environment. The gatew
 
 **Example:**
 
-```bash
-# In your .env file
-SUBNET_CIDR=172.30.0.0/16
+```yaml
+# In your config.yaml
+network:
+  subnet_cidr: 172.30.0.0/16
 ```
 
-**Finding the uplink interface (`UPLINK_INTERFACE`)**
+**Finding the uplink interface (`network.uplink_interface`)**
 
-`UPLINK_INTERFACE` tells Hypeman which host interface to use for routing VM traffic to the outside world (for iptables MASQUERADE rules). On many hosts this is `eth0`, but laptops and more complex setups often use Wi‑Fi or other names.
+`network.uplink_interface` tells Hypeman which host interface to use for routing VM traffic to the outside world (for iptables MASQUERADE rules). On many hosts this is `eth0`, but laptops and more complex setups often use Wi-Fi or other names.
 
 **Quick way to discover it:**
 
@@ -158,10 +160,11 @@ Look for the `dev` field in the output, for example:
 1.1.1.1 via 192.168.12.1 dev wlp2s0 src 192.168.12.98
 ```
 
-In this case, `wlp2s0` is the uplink interface, so you would set:
+In this case, `wlp2s0` is the uplink interface, so you would set in your config file:
 
-```bash
-UPLINK_INTERFACE=wlp2s0
+```yaml
+network:
+  uplink_interface: wlp2s0
 ```
 
 You can also inspect all routes:
@@ -178,15 +181,13 @@ Hypeman uses Caddy with automatic ACME certificates for TLS termination. Certifi
 
 To enable TLS ingresses:
 
-1. Configure ACME credentials in your `.env`:
+1. Configure ACME credentials in your `config.yaml`:
 
-```bash
-# Required for any TLS ingress
-ACME_EMAIL=admin@example.com
-
-# For Cloudflare
-ACME_DNS_PROVIDER=cloudflare
-CLOUDFLARE_API_TOKEN=your-api-token
+```yaml
+acme:
+  email: admin@example.com
+  dns_provider: cloudflare
+  cloudflare_api_token: your-api-token
 ```
 
 2. Create an ingress with TLS enabled:
@@ -205,13 +206,13 @@ curl -X POST http://localhost:8080/v1/ingresses \
   }'
 ```
 
-Certificates are stored in `$DATA_DIR/caddy/data/` and auto-renewed by Caddy.
+Certificates are stored in `<data_dir>/caddy/data/` and auto-renewed by Caddy.
 
 ### Setup
 
 ```bash
-cp .env.example .env
-# Edit .env and set JWT_SECRET and other configuration values
+cp config.example.yaml ~/.config/hypeman/config.yaml
+# Edit config.yaml and set jwt_secret and other configuration values
 ```
 
 ### Data directory
@@ -253,15 +254,16 @@ make gen-jwt
 make dev
 ```
 
-The server will start on port 8080 (configurable via `PORT` environment variable).
+The server will start on port 8080 (configurable via `port` in config.yaml).
 
 ### Setting Up the Builder Image (for Dockerfile builds)
 
-The builder image is required for `hypeman build` to work. When `BUILDER_IMAGE` is unset or empty, the server will automatically build and push the builder image on startup using Docker. This is the easiest way to get started — just ensure Docker is available and run `make dev`. If a build is requested while the builder image is still being prepared, the server returns a clear error asking you to retry shortly.
+The builder image is required for `hypeman build` to work. When `build.builder_image` is unset or empty, the server will automatically build and push the builder image on startup using Docker. This is the easiest way to get started — just ensure Docker is available and run `make dev`. If a build is requested while the builder image is still being prepared, the server returns a clear error asking you to retry shortly.
 
-On macOS with Colima, set the Docker socket path:
-```bash
-DOCKER_SOCKET=$HOME/.colima/default/docker.sock
+On macOS with Colima, set the Docker socket path in your config file:
+```yaml
+build:
+  docker_socket: ~/.colima/default/docker.sock
 ```
 
 ### Local OpenTelemetry (optional)
@@ -287,9 +289,11 @@ docker run -d --name lgtm \
 # If developing on a remote server, forward the port to your local machine (or YOLO):
 # ssh -L 3001:localhost:3000 your-server  (then open http://localhost:3001)
 
-# Enable OTel in .env (set ENV to your name to filter your telemetry)
-echo "OTEL_ENABLED=true" >> .env
-echo "ENV=yourname" >> .env
+# Enable OTel in config.yaml (set env to your name to filter your telemetry)
+# Add to your config.yaml:
+#   otel:
+#     enabled: true
+#   env: yourname
 
 # Restart dev server
 make dev
@@ -359,8 +363,9 @@ export PATH="/opt/homebrew/opt/e2fsprogs/bin:/opt/homebrew/opt/e2fsprogs/sbin:$P
 # Add to ~/.zshrc for persistence
 
 # 3. Configure environment
-cp .env.darwin.example .env
-# Edit .env as needed (defaults work for local development)
+mkdir -p ~/.config/hypeman
+cp config.example.darwin.yaml ~/.config/hypeman/config.yaml
+# Edit config.yaml as needed (defaults work for local development)
 
 # 4. Create data directory
 mkdir -p ~/Library/Application\ Support/hypeman
@@ -387,16 +392,16 @@ The `make dev` command automatically detects macOS and:
 
 ### macOS-Specific Configuration
 
-The following environment variables work differently on macOS (see `.env.darwin.example`):
+The following config keys work differently on macOS (see `config.example.darwin.yaml`):
 
-| Variable | Linux | macOS |
+| Config key | Linux | macOS |
 |----------|-------|-------|
-| `DEFAULT_HYPERVISOR` | `cloud-hypervisor` | `vz` |
-| `DATA_DIR` | `/var/lib/hypeman` | `~/Library/Application Support/hypeman` |
-| `INTERNAL_DNS_PORT` | `5353` | `5354` (5353 is used by mDNSResponder) |
-| `BRIDGE_NAME` | Used | Ignored (NAT) |
-| `SUBNET_CIDR` | Used | Ignored (NAT) |
-| `UPLINK_INTERFACE` | Used | Ignored (NAT) |
+| `hypervisor.default` | `cloud-hypervisor` | `vz` |
+| `data_dir` | `/var/lib/hypeman` | `~/Library/Application Support/hypeman` |
+| `caddy.internal_dns_port` | `5353` | `5354` (5353 is used by mDNSResponder) |
+| `network.bridge_name` | Used | Ignored (NAT) |
+| `network.subnet_cidr` | Used | Ignored (NAT) |
+| `network.uplink_interface` | Used | Ignored (NAT) |
 | Network rate limiting | Supported | Not supported |
 | GPU passthrough | Supported (VFIO) | Not supported |
 
@@ -463,8 +468,8 @@ brew install caddy
 
 **"address already in use" on port 5353**
 - Port 5353 is used by mDNSResponder (Bonjour) on macOS
-- Use port 5354 instead: `INTERNAL_DNS_PORT=5354` in `.env`
-- The `.env.darwin.example` already has this configured correctly
+- Use port 5354 instead: set `caddy.internal_dns_port: 5354` in `config.yaml`
+- The `config.example.darwin.yaml` already has this configured correctly
 
 **"Virtualization.framework is not available"**
 - Ensure you're on macOS 11.0+
@@ -475,7 +480,7 @@ brew install caddy
 - Check: `sw_vers` and `uname -m` (should be arm64)
 
 **VM fails to start**
-- Check serial log: `$DATA_DIR/instances/<id>/serial.log`
+- Check serial log: `<data_dir>/instances/<id>/serial.log`
 - Ensure kernel and initrd paths are correct in config
 
 **IOMMU/VFIO warnings at startup**

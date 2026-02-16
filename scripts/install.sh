@@ -9,6 +9,7 @@
 #   VERSION      - Install specific API version (default: latest)
 #   CLI_VERSION  - Install specific CLI version (default: latest)
 #   BRANCH       - Build from source using this branch (for development/testing)
+#   CLI_BRANCH   - Build CLI from source using this branch of kernel/hypeman-cli
 #   BINARY_DIR   - Use binaries from this directory instead of building/downloading
 #   INSTALL_DIR  - Binary installation directory (default: /opt/hypeman/bin on Linux, /usr/local/bin on macOS)
 #   DATA_DIR     - Data directory (default: /var/lib/hypeman on Linux, ~/Library/Application Support/hypeman on macOS)
@@ -101,7 +102,7 @@ else
     CONFIG_DIR="${CONFIG_DIR:-/etc/hypeman}"
 fi
 
-CONFIG_FILE="${CONFIG_DIR}/config"
+CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 SYSTEMD_DIR="/etc/systemd/system"
 
 # =============================================================================
@@ -248,15 +249,15 @@ if [ -n "$BINARY_DIR" ]; then
     info "Copying binaries from ${BINARY_DIR}..."
 
     if [ "$OS" = "darwin" ]; then
-        for f in "${BINARY_NAME}" "hypeman-token" ".env.darwin.example"; do
+        for f in "${BINARY_NAME}" "hypeman-token" "config.example.darwin.yaml"; do
             [ -f "${BINARY_DIR}/${f}" ] || error "File ${f} not found in ${BINARY_DIR}"
         done
-        cp "${BINARY_DIR}/.env.darwin.example" "${TMP_DIR}/.env.darwin.example"
+        cp "${BINARY_DIR}/config.example.darwin.yaml" "${TMP_DIR}/config.example.darwin.yaml"
     else
-        for f in "${BINARY_NAME}" "hypeman-token" ".env.example"; do
+        for f in "${BINARY_NAME}" "hypeman-token" "config.example.yaml"; do
             [ -f "${BINARY_DIR}/${f}" ] || error "File ${f} not found in ${BINARY_DIR}"
         done
-        cp "${BINARY_DIR}/.env.example" "${TMP_DIR}/.env.example"
+        cp "${BINARY_DIR}/config.example.yaml" "${TMP_DIR}/config.example.yaml"
     fi
 
     cp "${BINARY_DIR}/${BINARY_NAME}" "${TMP_DIR}/${BINARY_NAME}"
@@ -295,9 +296,9 @@ elif [ -n "$BRANCH" ]; then
             cat "$BUILD_LOG"
             error "Signing failed"
         fi
-        cp ".env.darwin.example" "${TMP_DIR}/.env.darwin.example"
+        cp "config.example.darwin.yaml" "${TMP_DIR}/config.example.darwin.yaml"
     else
-        cp ".env.example" "${TMP_DIR}/.env.example"
+        cp "config.example.yaml" "${TMP_DIR}/config.example.yaml"
     fi
     cp "bin/hypeman" "${TMP_DIR}/${BINARY_NAME}"
 
@@ -392,17 +393,9 @@ info "Installing hypeman-token to ${INSTALL_DIR}..."
 $SUDO install -m 755 "${TMP_DIR}/hypeman-token" "${INSTALL_DIR}/hypeman-token"
 
 if [ "$OS" = "linux" ]; then
-    # Install wrapper script to /usr/local/bin for easy access
-    info "Installing hypeman-token wrapper to /usr/local/bin..."
-    $SUDO tee /usr/local/bin/hypeman-token > /dev/null << EOF
-#!/bin/bash
-# Wrapper script for hypeman-token that loads config from ${CONFIG_FILE}
-set -a
-source ${CONFIG_FILE}
-set +a
-exec ${INSTALL_DIR}/hypeman-token "\$@"
-EOF
-    $SUDO chmod 755 /usr/local/bin/hypeman-token
+    # Symlink to /usr/local/bin for easy access
+    info "Linking hypeman-token to /usr/local/bin..."
+    $SUDO ln -sf "${INSTALL_DIR}/hypeman-token" /usr/local/bin/hypeman-token
 fi
 
 # =============================================================================
@@ -429,26 +422,31 @@ fi
 # =============================================================================
 
 if [ ! -f "$CONFIG_FILE" ]; then
+    info "Generating JWT secret..."
+    JWT_SECRET=$(openssl rand -hex 32)
+
     if [ "$OS" = "darwin" ]; then
-        # macOS config
-        if [ -f "${TMP_DIR}/.env.darwin.example" ]; then
+        # macOS config - use template from source or download it
+        if [ -f "${TMP_DIR}/config.example.darwin.yaml" ]; then
             info "Using macOS config template from source..."
-            cp "${TMP_DIR}/.env.darwin.example" "${TMP_DIR}/config"
+            cp "${TMP_DIR}/config.example.darwin.yaml" "${TMP_DIR}/config.yaml"
         else
             info "Downloading macOS config template..."
-            CONFIG_URL="https://raw.githubusercontent.com/${REPO}/${VERSION}/.env.darwin.example"
-            if ! curl -fsSL "$CONFIG_URL" -o "${TMP_DIR}/config"; then
+            CONFIG_URL="https://raw.githubusercontent.com/${REPO}/${VERSION}/config.example.darwin.yaml"
+            if ! curl -fsSL "$CONFIG_URL" -o "${TMP_DIR}/config.yaml"; then
                 error "Failed to download config template from ${CONFIG_URL}"
             fi
         fi
 
-        # Expand ~ to $HOME (launchd doesn't do shell expansion)
-        sed -i '' "s|~/|${HOME}/|g" "${TMP_DIR}/config"
+        # Expand ~ to $HOME in data_dir (launchd doesn't do shell expansion)
+        sed -i '' "s|~/|${HOME}/|g" "${TMP_DIR}/config.yaml"
 
-        # Generate random JWT secret
-        info "Generating JWT secret..."
-        JWT_SECRET=$(openssl rand -hex 32)
-        sed -i '' "s/^JWT_SECRET=.*/JWT_SECRET=${JWT_SECRET}/" "${TMP_DIR}/config"
+        # Set jwt_secret in the config
+        if grep -q '^jwt_secret:' "${TMP_DIR}/config.yaml"; then
+            sed -i '' "s|^jwt_secret:.*|jwt_secret: \"${JWT_SECRET}\"|" "${TMP_DIR}/config.yaml"
+        else
+            error "Config template missing jwt_secret field — cannot configure authentication"
+        fi
 
         # Auto-detect Docker socket
         DOCKER_SOCKET=""
@@ -461,45 +459,61 @@ if [ ! -f "$CONFIG_FILE" ]; then
         fi
         if [ -n "$DOCKER_SOCKET" ]; then
             info "Detected Docker socket: ${DOCKER_SOCKET}"
-            if grep -q '^DOCKER_SOCKET=' "${TMP_DIR}/config"; then
-                sed -i '' "s|^DOCKER_SOCKET=.*|DOCKER_SOCKET=${DOCKER_SOCKET}|" "${TMP_DIR}/config"
-            elif grep -q '^# DOCKER_SOCKET=' "${TMP_DIR}/config"; then
-                sed -i '' "s|^# DOCKER_SOCKET=.*|DOCKER_SOCKET=${DOCKER_SOCKET}|" "${TMP_DIR}/config"
+            # Docker socket is nested under build: in the config
+            if grep -q '^build:' "${TMP_DIR}/config.yaml"; then
+                # build: section exists, check for docker_socket within it
+                if grep -q '^  docker_socket:' "${TMP_DIR}/config.yaml"; then
+                    sed -i '' "s|^  docker_socket:.*|  docker_socket: \"${DOCKER_SOCKET}\"|" "${TMP_DIR}/config.yaml"
+                else
+                    # Append docker_socket after the build: line (BSD-compatible)
+                    sed -i '' "s|^build:|build:\\
+  docker_socket: \"${DOCKER_SOCKET}\"|" "${TMP_DIR}/config.yaml"
+                fi
             else
-                echo "DOCKER_SOCKET=${DOCKER_SOCKET}" >> "${TMP_DIR}/config"
+                # No build: section, add one
+                printf "\nbuild:\n  docker_socket: \"%s\"\n" "${DOCKER_SOCKET}" >> "${TMP_DIR}/config.yaml"
             fi
         fi
 
         info "Installing config file at ${CONFIG_FILE}..."
-        install -m 600 "${TMP_DIR}/config" "$CONFIG_FILE"
+        install -m 600 "${TMP_DIR}/config.yaml" "$CONFIG_FILE"
     else
-        # Linux config
-        if [ -f "${TMP_DIR}/.env.example" ]; then
+        # Linux config - use template from source or download it
+        if [ -f "${TMP_DIR}/config.example.yaml" ]; then
             info "Using config template from source..."
-            cp "${TMP_DIR}/.env.example" "${TMP_DIR}/config"
+            cp "${TMP_DIR}/config.example.yaml" "${TMP_DIR}/config.yaml"
         else
             info "Downloading config template..."
-            CONFIG_URL="https://raw.githubusercontent.com/${REPO}/${VERSION}/.env.example"
-            if ! curl -fsSL "$CONFIG_URL" -o "${TMP_DIR}/config"; then
+            CONFIG_URL="https://raw.githubusercontent.com/${REPO}/${VERSION}/config.example.yaml"
+            if ! curl -fsSL "$CONFIG_URL" -o "${TMP_DIR}/config.yaml"; then
                 error "Failed to download config template from ${CONFIG_URL}"
             fi
         fi
 
-        # Generate random JWT secret
-        info "Generating JWT secret..."
-        JWT_SECRET=$(openssl rand -hex 32)
-        sed -i "s/^JWT_SECRET=$/JWT_SECRET=${JWT_SECRET}/" "${TMP_DIR}/config"
+        # Set jwt_secret in the config
+        if grep -q '^jwt_secret:' "${TMP_DIR}/config.yaml"; then
+            sed -i "s|^jwt_secret:.*|jwt_secret: \"${JWT_SECRET}\"|" "${TMP_DIR}/config.yaml"
+        else
+            error "Config template missing jwt_secret field — cannot configure authentication"
+        fi
 
-        # Set fixed ports for production (instead of random ports used in dev)
-        sed -i "s/^# CADDY_ADMIN_PORT=.*/CADDY_ADMIN_PORT=2019/" "${TMP_DIR}/config"
-        sed -i "s/^# INTERNAL_DNS_PORT=.*/INTERNAL_DNS_PORT=5353/" "${TMP_DIR}/config"
+        # Set fixed ports for production (nested under caddy:)
+        # Uncomment the caddy block and set ports
+        if grep -q '^# caddy:' "${TMP_DIR}/config.yaml"; then
+            sed -i "s|^# caddy:|caddy:|" "${TMP_DIR}/config.yaml"
+            sed -i "s|^#   admin_port:.*|  admin_port: 2019|" "${TMP_DIR}/config.yaml"
+            sed -i "s|^#   internal_dns_port:.*|  internal_dns_port: 5353|" "${TMP_DIR}/config.yaml"
+        fi
 
         info "Installing config file at ${CONFIG_FILE}..."
-        $SUDO install -m 640 "${TMP_DIR}/config" "$CONFIG_FILE"
+        $SUDO install -m 640 "${TMP_DIR}/config.yaml" "$CONFIG_FILE"
         $SUDO chown root:root "$CONFIG_FILE"
     fi
 else
     info "Config file already exists at ${CONFIG_FILE}, skipping..."
+    # Read JWT_SECRET from existing config for CLI token generation
+    # Handle: leading whitespace, single/double quotes, trailing whitespace
+    JWT_SECRET=$($SUDO grep -E '^[[:space:]]*jwt_secret[[:space:]]*:' "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/^[[:space:]]*jwt_secret[[:space:]]*:[[:space:]]*//' | tr -d "\"'" | sed 's/[[:space:]]*$//' || true)
 fi
 
 # =============================================================================
@@ -513,21 +527,6 @@ if [ "$OS" = "darwin" ]; then
     mkdir -p "$PLIST_DIR"
 
     info "Installing launchd service..."
-
-    # Build environment variables from config file
-    ENV_DICT=""
-    if [ -f "$CONFIG_FILE" ]; then
-        while IFS= read -r line; do
-            # Skip comments and empty lines
-            [[ "$line" =~ ^[[:space:]]*# ]] && continue
-            [[ -z "$line" ]] && continue
-            key="${line%%=*}"
-            value="${line#*=}"
-            ENV_DICT="${ENV_DICT}
-        <key>${key}</key>
-        <string>${value}</string>"
-        done < "$CONFIG_FILE"
-    fi
 
     cat > "$PLIST_PATH" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -543,7 +542,9 @@ if [ "$OS" = "darwin" ]; then
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/opt/e2fsprogs/sbin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>${ENV_DICT}
+        <string>/opt/homebrew/opt/e2fsprogs/sbin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>CONFIG_PATH</key>
+        <string>${CONFIG_FILE}</string>
     </dict>
     <key>KeepAlive</key>
     <true/>
@@ -571,7 +572,7 @@ After=network.target
 [Service]
 Type=simple
 Environment="HOME=${DATA_DIR}"
-EnvironmentFile=${CONFIG_FILE}
+Environment="CONFIG_PATH=${CONFIG_FILE}"
 ExecStart=${INSTALL_DIR}/${BINARY_NAME}
 Restart=on-failure
 RestartSec=5
@@ -629,64 +630,120 @@ fi
 # =============================================================================
 
 CLI_REPO="kernel/hypeman-cli"
+CLI_INSTALLED=false
 
-# CLI releases use goreleaser naming: "macos" not "darwin", .zip not .tar.gz on macOS
-if [ "$OS" = "darwin" ]; then
-    CLI_OS="macos"
-    CLI_EXT="zip"
+if [ -n "$CLI_BRANCH" ]; then
+    # Build CLI from source
+    info "Building CLI from source (branch: $CLI_BRANCH)..."
+    command -v go >/dev/null 2>&1 || error "go is required for CLI_BRANCH mode but not installed"
+
+    CLI_BUILD_DIR="${TMP_DIR}/hypeman-cli"
+    if ! git clone --branch "$CLI_BRANCH" --depth 1 -q "https://github.com/${CLI_REPO}.git" "$CLI_BUILD_DIR" 2>&1; then
+        error "Failed to clone CLI repository (branch: $CLI_BRANCH)"
+    fi
+
+    info "Compiling CLI..."
+    mkdir -p "${TMP_DIR}/cli-bin"
+    if ! (cd "$CLI_BUILD_DIR" && go build -o "${TMP_DIR}/cli-bin/hypeman" ./cmd/hypeman 2>&1); then
+        error "Failed to build CLI from source"
+    fi
+
+    info "Installing hypeman CLI to ${INSTALL_DIR}..."
+    $SUDO install -m 755 "${TMP_DIR}/cli-bin/hypeman" "${INSTALL_DIR}/hypeman"
+    if [ "$OS" != "darwin" ]; then
+        info "Linking hypeman to /usr/local/bin..."
+        $SUDO ln -sf "${INSTALL_DIR}/hypeman" /usr/local/bin/hypeman
+    fi
+    CLI_INSTALLED=true
 else
-    CLI_OS="$OS"
-    CLI_EXT="tar.gz"
-fi
+    # Download CLI from release
+    # CLI releases use goreleaser naming: "macos" not "darwin", .zip not .tar.gz on macOS
+    if [ "$OS" = "darwin" ]; then
+        CLI_OS="macos"
+        CLI_EXT="zip"
+    else
+        CLI_OS="$OS"
+        CLI_EXT="tar.gz"
+    fi
 
-if [ -z "$CLI_VERSION" ] || [ "$CLI_VERSION" == "latest" ]; then
-    info "Fetching latest CLI version with available artifacts..."
-    CLI_VERSION=$(find_release_with_artifact "$CLI_REPO" "hypeman" "$CLI_OS" "$ARCH" "$CLI_EXT" || true)
-    if [ -z "$CLI_VERSION" ]; then
-        warn "Failed to find a CLI release with artifacts for ${CLI_OS}/${ARCH}, skipping CLI installation"
+    if [ -z "$CLI_VERSION" ] || [ "$CLI_VERSION" == "latest" ]; then
+        info "Fetching latest CLI version with available artifacts..."
+        CLI_VERSION=$(find_release_with_artifact "$CLI_REPO" "hypeman" "$CLI_OS" "$ARCH" "$CLI_EXT" || true)
+        if [ -z "$CLI_VERSION" ]; then
+            warn "Failed to find a CLI release with artifacts for ${CLI_OS}/${ARCH}, skipping CLI installation"
+        fi
+    fi
+
+    if [ -n "$CLI_VERSION" ]; then
+        info "Installing Hypeman CLI version: $CLI_VERSION"
+
+        CLI_VERSION_NUM="${CLI_VERSION#v}"
+        CLI_ARCHIVE_NAME="hypeman_${CLI_VERSION_NUM}_${CLI_OS}_${ARCH}.${CLI_EXT}"
+        CLI_DOWNLOAD_URL="https://github.com/${CLI_REPO}/releases/download/${CLI_VERSION}/${CLI_ARCHIVE_NAME}"
+
+        info "Downloading CLI ${CLI_ARCHIVE_NAME}..."
+        if curl -fsSL "$CLI_DOWNLOAD_URL" -o "${TMP_DIR}/${CLI_ARCHIVE_NAME}"; then
+            info "Extracting CLI..."
+            mkdir -p "${TMP_DIR}/cli"
+            if [ "$CLI_EXT" = "zip" ]; then
+                unzip -qo "${TMP_DIR}/${CLI_ARCHIVE_NAME}" -d "${TMP_DIR}/cli"
+            else
+                tar -xzf "${TMP_DIR}/${CLI_ARCHIVE_NAME}" -C "${TMP_DIR}/cli"
+            fi
+
+            if [ "$OS" = "darwin" ]; then
+                info "Installing hypeman CLI to ${INSTALL_DIR}..."
+                $SUDO install -m 755 "${TMP_DIR}/cli/hypeman" "${INSTALL_DIR}/hypeman"
+            else
+                info "Installing hypeman CLI to ${INSTALL_DIR}..."
+                $SUDO install -m 755 "${TMP_DIR}/cli/hypeman" "${INSTALL_DIR}/hypeman"
+
+                info "Linking hypeman to /usr/local/bin..."
+                $SUDO ln -sf "${INSTALL_DIR}/hypeman" /usr/local/bin/hypeman
+            fi
+            CLI_INSTALLED=true
+        else
+            warn "Failed to download CLI from ${CLI_DOWNLOAD_URL}, skipping CLI installation"
+        fi
     fi
 fi
 
-if [ -n "$CLI_VERSION" ]; then
-    info "Installing Hypeman CLI version: $CLI_VERSION"
+# Generate CLI config file with a pre-authenticated token
+if [ "$CLI_INSTALLED" = true ]; then
+    CLI_CONFIG_DIR="$HOME/.config/hypeman"
+    CLI_CONFIG_FILE="${CLI_CONFIG_DIR}/cli.yaml"
+    if [ ! -f "$CLI_CONFIG_FILE" ]; then
+        info "Generating CLI configuration..."
+        mkdir -p "$CLI_CONFIG_DIR"
 
-    CLI_VERSION_NUM="${CLI_VERSION#v}"
-    CLI_ARCHIVE_NAME="hypeman_${CLI_VERSION_NUM}_${CLI_OS}_${ARCH}.${CLI_EXT}"
-    CLI_DOWNLOAD_URL="https://github.com/${CLI_REPO}/releases/download/${CLI_VERSION}/${CLI_ARCHIVE_NAME}"
-
-    info "Downloading CLI ${CLI_ARCHIVE_NAME}..."
-    if curl -fsSL "$CLI_DOWNLOAD_URL" -o "${TMP_DIR}/${CLI_ARCHIVE_NAME}"; then
-        info "Extracting CLI..."
-        mkdir -p "${TMP_DIR}/cli"
-        if [ "$CLI_EXT" = "zip" ]; then
-            unzip -qo "${TMP_DIR}/${CLI_ARCHIVE_NAME}" -d "${TMP_DIR}/cli"
-        else
-            tar -xzf "${TMP_DIR}/${CLI_ARCHIVE_NAME}" -C "${TMP_DIR}/cli"
+        # Determine the port from config
+        CLI_PORT="8080"
+        if [ -f "$CONFIG_FILE" ]; then
+            PARSED_PORT=$(grep -E '^[[:space:]]*port[[:space:]]*:' "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/^[[:space:]]*port[[:space:]]*:[[:space:]]*//' | tr -d "\"'" | sed 's/[[:space:]]*$//' || true)
+            if [ -n "$PARSED_PORT" ]; then
+                CLI_PORT="$PARSED_PORT"
+            fi
         fi
 
-        if [ "$OS" = "darwin" ]; then
-            info "Installing hypeman CLI to ${INSTALL_DIR}..."
-            $SUDO install -m 755 "${TMP_DIR}/cli/hypeman" "${INSTALL_DIR}/hypeman"
+        # Generate a long-lived CLI token
+        # Pass JWT_SECRET explicitly since the config file may not be readable by the current user
+        CLI_TOKEN=$(JWT_SECRET="${JWT_SECRET}" "${INSTALL_DIR}/hypeman-token" -user-id "cli-$(whoami)" -duration 8760h 2>/dev/null || true)
+        if [ -z "$CLI_TOKEN" ]; then
+            warn "Failed to generate CLI token. You may need to run: hypeman-token -user-id cli-$(whoami) > token and add it to ${CLI_CONFIG_FILE}"
+            cat > "$CLI_CONFIG_FILE" << CLIEOF
+base_url: http://localhost:${CLI_PORT}
+api_key: ""
+CLIEOF
         else
-            # Install CLI binary
-            info "Installing hypeman CLI to ${INSTALL_DIR}..."
-            $SUDO install -m 755 "${TMP_DIR}/cli/hypeman" "${INSTALL_DIR}/hypeman-cli"
-
-            # Install wrapper script to /usr/local/bin for PATH access
-            info "Installing hypeman wrapper to /usr/local/bin..."
-            $SUDO tee /usr/local/bin/hypeman > /dev/null << WRAPPER
-#!/bin/bash
-# Wrapper script for hypeman CLI that auto-generates API token
-set -a
-source ${CONFIG_FILE}
-set +a
-export HYPEMAN_API_KEY=\$(${INSTALL_DIR}/hypeman-token -user-id "cli-user-\$(whoami)" 2>/dev/null)
-exec ${INSTALL_DIR}/hypeman-cli "\$@"
-WRAPPER
-            $SUDO chmod 755 /usr/local/bin/hypeman
+            cat > "$CLI_CONFIG_FILE" << CLIEOF
+base_url: http://localhost:${CLI_PORT}
+api_key: "${CLI_TOKEN}"
+CLIEOF
         fi
+        chmod 600 "$CLI_CONFIG_FILE"
+        info "CLI configured at ${CLI_CONFIG_FILE}"
     else
-        warn "Failed to download CLI from ${CLI_DOWNLOAD_URL}, skipping CLI installation"
+        info "CLI config already exists at ${CLI_CONFIG_FILE}, skipping..."
     fi
 fi
 
@@ -712,7 +769,8 @@ if [ "$OS" = "darwin" ]; then
     echo "  API Binary:   ${INSTALL_DIR}/${BINARY_NAME}"
     echo "  CLI:          ${INSTALL_DIR}/hypeman"
     echo "  Token tool:   ${INSTALL_DIR}/hypeman-token"
-    echo "  Config:       ${CONFIG_FILE}"
+    echo "  Server config: ${CONFIG_FILE}"
+    echo "  CLI config:   ~/.config/hypeman/cli.yaml"
     echo "  Data:         ${DATA_DIR}"
     echo "  Service:      ~/Library/LaunchAgents/com.kernel.hypeman.plist"
     echo "  Logs:         ${DATA_DIR}/logs/hypeman.log"
@@ -720,7 +778,8 @@ else
     echo "  API Binary:   ${INSTALL_DIR}/${BINARY_NAME}"
     echo "  CLI:          /usr/local/bin/hypeman"
     echo "  Token tool:   /usr/local/bin/hypeman-token"
-    echo "  Config:       ${CONFIG_FILE}"
+    echo "  Server config: ${CONFIG_FILE}"
+    echo "  CLI config:   ~/.config/hypeman/cli.yaml"
     echo "  Data:         ${DATA_DIR}"
     echo "  Service:      ${SERVICE_NAME}.service"
 fi
@@ -728,7 +787,7 @@ fi
 echo ""
 echo ""
 echo "Next steps:"
-echo "  - (Optional) Edit ${CONFIG_FILE} to configure your installation"
+echo "  - (Optional) Edit ${CONFIG_FILE} to configure your server"
 echo ""
 echo "Get Started:"
 echo "╭──────────────────────────────────────────╮"
