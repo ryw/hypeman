@@ -3,6 +3,7 @@ SHELL := /bin/bash
 
 # Directory where local binaries will be installed
 BIN_DIR ?= $(CURDIR)/bin
+GO_TEST_TIMEOUT ?= 300s
 
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
@@ -13,7 +14,7 @@ OAPI_CODEGEN_VERSION ?= v2.5.1
 AIR ?= $(BIN_DIR)/air
 WIRE ?= $(BIN_DIR)/wire
 XCADDY ?= $(BIN_DIR)/xcaddy
-TEST_TIMEOUT ?= 600s
+TEST_TIMEOUT ?= $(GO_TEST_TIMEOUT)
 
 # Install oapi-codegen (pinned to match committed generated code)
 $(OAPI_CODEGEN): | $(BIN_DIR)
