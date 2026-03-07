@@ -1357,6 +1357,20 @@ func TestStandbyAndRestore(t *testing.T) {
 	t.Log("Standby/restore test complete!")
 }
 
+func TestCloudHypervisorSnapshotFeature(t *testing.T) {
+	if _, err := os.Stat("/dev/kvm"); os.IsNotExist(err) {
+		t.Skip("/dev/kvm not available, skipping on this platform")
+	}
+
+	mgr, tmpDir := setupTestManager(t)
+	runStandbySnapshotScenario(t, mgr, tmpDir, snapshotScenarioConfig{
+		hypervisor: hypervisor.TypeCloudHypervisor,
+		sourceName: "ch-snapshot-src",
+		snapshot:   "ch-snapshot-1",
+		forkName:   "ch-snapshot-fork",
+	})
+}
+
 func TestStateTransitions(t *testing.T) {
 	tests := []struct {
 		name       string

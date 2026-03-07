@@ -381,3 +381,15 @@ func TestFirecrackerForkFromRunningNetwork(t *testing.T) {
 	assert.NotEqual(t, sourceAfterFork.IP, forked.IP)
 	assert.NotEqual(t, sourceAfterFork.MAC, forked.MAC)
 }
+
+func TestFirecrackerSnapshotFeature(t *testing.T) {
+	requireFirecrackerIntegrationPrereqs(t)
+
+	mgr, tmpDir := setupTestManagerForFirecracker(t)
+	runStandbySnapshotScenario(t, mgr, tmpDir, snapshotScenarioConfig{
+		hypervisor: hypervisor.TypeFirecracker,
+		sourceName: "fc-snapshot-src",
+		snapshot:   "fc-snapshot-1",
+		forkName:   "fc-snapshot-fork",
+	})
+}

@@ -732,3 +732,27 @@ func ensureMkfsExt4Available(t *testing.T) {
 
 	t.Fatalf("mkfs.ext4 not found; install e2fsprogs and ensure it is on PATH")
 }
+
+func TestVZSnapshotFeature(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("vz tests require macOS")
+	}
+	if runtime.GOARCH != "arm64" {
+		t.Skip("vz tests require Apple Silicon (arm64)")
+	}
+	if !isMacOS14OrLater(t) {
+		t.Skip("vz snapshot test requires macOS 14+")
+	}
+	ensureMkfsExt4Available(t)
+
+	mgr, tmpDir := setupVZTestManager(t)
+	runStandbySnapshotScenario(t, mgr, tmpDir, snapshotScenarioConfig{
+		hypervisor: hypervisor.TypeVZ,
+		sourceName: "vz-snapshot-src",
+		snapshot:   "vz-snapshot-1",
+		forkName:   "vz-snapshot-fork",
+		onError: func() {
+			dumpVZShimLogs(t, tmpDir)
+		},
+	})
+}

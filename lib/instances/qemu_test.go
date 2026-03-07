@@ -954,3 +954,22 @@ func TestQEMUForkFromRunningNetwork(t *testing.T) {
 	assertHostCanReachNginx(t, forked.IP, 80, 60*time.Second)
 	assertHostCanReachNginx(t, sourceAfterFork.IP, 80, 60*time.Second)
 }
+
+func TestQEMUSnapshotFeature(t *testing.T) {
+	if _, err := os.Stat("/dev/kvm"); os.IsNotExist(err) {
+		t.Skip("/dev/kvm not available, skipping on this platform")
+	}
+
+	starter := qemu.NewStarter()
+	if _, err := starter.GetBinaryPath(nil, ""); err != nil {
+		t.Skipf("QEMU not available: %v", err)
+	}
+
+	mgr, tmpDir := setupTestManagerForQEMU(t)
+	runStandbySnapshotScenario(t, mgr, tmpDir, snapshotScenarioConfig{
+		hypervisor: hypervisor.TypeQEMU,
+		sourceName: "qemu-snapshot-src",
+		snapshot:   "qemu-snapshot-1",
+		forkName:   "qemu-snapshot-fork",
+	})
+}
