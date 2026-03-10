@@ -299,6 +299,8 @@ func (m *manager) createInstance(
 		CreatedAt:                time.Now(),
 		StartedAt:                nil,
 		StoppedAt:                nil,
+		ProgramStartedAt:         nil,
+		GuestAgentReadyAt:        nil,
 		KernelVersion:            string(kernelVer),
 		HypervisorType:           hvType,
 		HypervisorVersion:        hvVersion,
@@ -406,7 +408,15 @@ func (m *manager) createInstance(
 		return nil, fmt.Errorf("create config disk: %w", err)
 	}
 
-	// 17. Save metadata
+	// 17. Record boot start time before launching the VM so marker hydration
+	// can safely ignore stale sentinels from prior runs.
+	if err := m.archiveAppLogForBoot(id); err != nil {
+		log.WarnContext(ctx, "failed to archive app log before create boot", "instance_id", id, "error", err)
+	}
+	bootStart := time.Now().UTC()
+	stored.StartedAt = &bootStart
+
+	// 18. Save metadata
 	log.DebugContext(ctx, "saving instance metadata", "instance_id", id)
 	meta := &metadata{StoredMetadata: *stored}
 	if err := m.saveMetadata(meta); err != nil {
@@ -414,17 +424,14 @@ func (m *manager) createInstance(
 		return nil, fmt.Errorf("save metadata: %w", err)
 	}
 
-	// 18. Start VMM and boot VM
+	// 19. Start VMM and boot VM
 	log.InfoContext(ctx, "starting VMM and booting VM", "instance_id", id)
 	if err := m.startAndBootVM(ctx, stored, imageInfo, netConfig); err != nil {
 		log.ErrorContext(ctx, "failed to start and boot VM", "instance_id", id, "error", err)
 		return nil, err
 	}
 
-	// 19. Update timestamp after VM is running
-	now := time.Now()
-	stored.StartedAt = &now
-
+	// 20. Persist runtime metadata updates after VM boot.
 	meta = &metadata{StoredMetadata: *stored}
 	if err := m.saveMetadata(meta); err != nil {
 		// VM is running but metadata failed - log but don't fail
@@ -435,14 +442,18 @@ func (m *manager) createInstance(
 	// Success - release cleanup stack (prevent cleanup)
 	cu.Release()
 
+	// Return instance with derived state
+	finalInst := m.toInstance(ctx, meta)
+	if finalInst.BootMarkersHydrated {
+		if err := m.saveMetadata(meta); err != nil {
+			log.WarnContext(ctx, "failed to persist hydrated boot markers after create", "instance_id", id, "error", err)
+		}
+	}
 	// Record metrics
 	if m.metrics != nil {
 		m.recordDuration(ctx, m.metrics.createDuration, start, "success", hvType)
-		m.recordStateTransition(ctx, "stopped", string(StateRunning), hvType)
+		m.recordStateTransition(ctx, string(StateStopped), string(finalInst.State), hvType)
 	}
-
-	// Return instance with derived state
-	finalInst := m.toInstance(ctx, meta)
 	log.InfoContext(ctx, "instance created successfully", "instance_id", id, "name", req.Name, "state", finalInst.State, "hypervisor", hvType)
 	return &finalInst, nil
 }
